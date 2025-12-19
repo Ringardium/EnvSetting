@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  srs:
+    image: ossrs/srs:6
+    container_name: srs
+    command: ./objs/srs -c /usr/local/srs/conf/srs.conf
+    ports:
+      - "10080:10080/udp"   # SRT
+      - "1985:1985"         # HTTP API
+      - "1935:1935"         # RTMP
+      - "443:8080"          # HTTP/HLS
+    volumes:
+      - ./srs.conf:/usr/local/srs/conf/srs.conf
+      - ./hls:/hls
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+  recorder:
+    image: linuxserver/ffmpeg
+    container_name: recorder
+    entrypoint: /bin/bash
+    command: /scripts/recorder.sh
+    volumes:
+      - ./recordings:/recordings
+      - ./recorder.sh:/scripts/recorder.sh:ro
+    depends_on:
+      - srs
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+  #==============================================================
+  # H.265→H.264 트랜스코더 (필요시 사용)
+  #==============================================================
+  transcoder:
+    image: linuxserver/ffmpeg
+    container_name: transcoder
+    entrypoint: /bin/bash
+    command: /scripts/transcoder.sh
+    environment:
+      - VIDEO_CODEC=libx264        # Docker: libx264 (소프트웨어)
+      - PRESET=veryfast
+      - BITRATE=2000k
+    volumes:
+      - ./transcoder.sh:/scripts/transcoder.sh:ro
+    depends_on:
+      - srs
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+  #==============================================================
+  # S3 업로드 서비스
+  #==============================================================
+  s3-uploader:
+    build: ./s3-uploader
+    container_name: s3-uploader
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - S3_BUCKET=${S3_BUCKET}
+      - DELETE_LOCAL=true
+      - UPLOAD_HLS=true
+      - UPLOAD_RECORDINGS=true
+      - RECORDING_DELAY_MINUTES=10
+    volumes:
+      - ./hls:/hls
+      - ./recordings:/recordings
+    restart: unless-stopped
+    networks:
+      - cctv-network
+
+networks:
+  cctv-network:
+    driver: bridge
