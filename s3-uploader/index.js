@@ -1,5 +1,5 @@
 const express = require('express');
-const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const fs = require('fs');
 const path = require('path');
 const chokidar = require('chokidar');
@@ -25,12 +25,68 @@ const RECORDING_DELAY_MS = parseInt(process.env.RECORDING_DELAY_MINUTES || '10')
 // 대기 중인 녹화 파일 타이머
 const pendingRecordings = new Map();
 
+// ==================== S3 동기화 (시작 시 고아 파일 정리) ====================
+async function syncHLSWithS3() {
+  console.log('[Sync] Starting S3 sync - cleaning orphaned files...');
+
+  let continuationToken;
+  let deletedCount = 0;
+
+  try {
+    do {
+      const response = await s3Client.send(new ListObjectsV2Command({
+        Bucket: BUCKET_NAME,
+        Prefix: 'hls/',
+        ContinuationToken: continuationToken,
+      }));
+
+      if (response.Contents) {
+        for (const obj of response.Contents) {
+          const s3Key = obj.Key;
+          const localPath = '/' + s3Key; // hls/... -> /hls/...
+
+          // .DS_Store나 숨김파일은 무조건 삭제
+          if (s3Key.includes('.DS_Store') || path.basename(s3Key).startsWith('.')) {
+            await s3Client.send(new DeleteObjectCommand({
+              Bucket: BUCKET_NAME,
+              Key: s3Key,
+            }));
+            console.log(`[Sync] Deleted (hidden): ${s3Key}`);
+            deletedCount++;
+            continue;
+          }
+
+          // 로컬에 없으면 S3에서 삭제
+          if (!fs.existsSync(localPath)) {
+            await s3Client.send(new DeleteObjectCommand({
+              Bucket: BUCKET_NAME,
+              Key: s3Key,
+            }));
+            console.log(`[Sync] Deleted (orphaned): ${s3Key}`);
+            deletedCount++;
+          }
+        }
+      }
+
+      continuationToken = response.NextContinuationToken;
+    } while (continuationToken);
+
+    console.log(`[Sync] Completed. Deleted ${deletedCount} orphaned files.`);
+  } catch (error) {
+    console.error('[Sync] Error:', error.message);
+  }
+}
+
 // ==================== HLS 업로드 (실시간 감시) ====================
 if (UPLOAD_HLS) {
+  // 시작 시 S3 동기화 실행
+  syncHLSWithS3();
   const hlsWatcher = chokidar.watch('/hls', {
-    ignored: /^\./,
+    ignored: ['**/.DS_Store', '**/.*'],
     persistent: true,
     ignoreInitial: false,
+    usePolling: true,
+    interval: 500,
     awaitWriteFinish: {
       stabilityThreshold: 500,
       pollInterval: 100
@@ -88,9 +144,11 @@ async function deleteHLS(filePath) {
 // ==================== Recording 업로드 (10분 지연 감시 방식) ====================
 if (UPLOAD_RECORDINGS) {
   const recordingWatcher = chokidar.watch('/recordings', {
-    ignored: /^\./,
+    ignored: ['**/.DS_Store', '**/.*'],
     persistent: true,
     ignoreInitial: true, // 기존 파일은 무시
+    usePolling: true,
+    interval: 1000,
     awaitWriteFinish: {
       stabilityThreshold: 2000, // 녹화 파일은 더 긴 안정화 시간
       pollInterval: 500
